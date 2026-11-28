@@ -1,70 +1,68 @@
-name: Publish apt repository
-
+name: publish
+# Pure publisher: renders, signs, verifies and deploys exactly what menta-linux/artifacts channels.json names. Self-repairing: every run compares the
+# live site's generation with the desired one, so an interrupted publication is repaired by the next scheduled run.
 on:
-  workflow_dispatch:      # manual only: Actions -> Publish apt repository -> Run workflow
-
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
 permissions:
   contents: read
   pages: write
   id-token: write
-
 concurrency:
   group: pages
   cancel-in-progress: false
-
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends apt-utils gnupg xz-utils
-
-      - name: Download the artifacts (one release per channel)
-        env:
-          # Needs read access to menta-linux/artifacts (public: the workflow token is enough).
-          GH_TOKEN: ${{ secrets.MENTA_TOKEN || github.token }}
-          ARTIFACTS_REPO: menta-linux/artifacts
-        run: |
-          mkdir -p debs
-          for tag in $(gh release list -R "$ARTIFACTS_REPO" --json tagName,isDraft -q '.[] | select(.isDraft | not) | .tagName'); do
-            echo "== channel $tag"
-            mkdir -p "debs/$tag"
-            gh release download "$tag" -R "$ARTIFACTS_REPO" -p '*.deb' -D "debs/$tag" --clobber || echo "::warning::no .deb files in release $tag"
-          done
-          find debs -name '*.deb' | wc -l
-
-      - name: Import signing key
-        id: gpg
-        env:
-          KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-        run: |
-          if [ -n "$KEY" ]; then
-            printf '%s' "$KEY" | gpg --batch --import
-            echo "id=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::APT_GPG_PRIVATE_KEY is not set: publishing an UNSIGNED repository"
-          fi
-
-      - name: Build repository
-        env:
-          GPG_KEY_ID: ${{ steps.gpg.outputs.id }}
-        run: |
-          ./build-repo.sh debs site
-          cp setup.sh site/setup.sh
-          cp index.html site/index.html
-
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: menta-linux/artifacts
+          path: artifacts
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: menta-linux/orchestrator
+          ref: 75a8be38c682bc43940bfc201ac28cd5cea80d53
+          path: orchestrator
+          persist-credentials: false
+      - name: Install tooling (distribution packages only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-debian python3-jsonschema python3-cryptography python3-yaml python3-apt dose-builddebcheck dose-extra gnupg gpgv debian-archive-keyring git
+      - name: Render, sign and verify (a missing key, a missing asset or a failed verification stops here and changes nothing)
+        id: render
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          cd orchestrator
+          out=$(PYTHONPATH=src python3 -m menta_ci.cli publish --artifacts "$GITHUB_WORKSPACE/artifacts" --out "$RUNNER_TEMP/out" --cache "$RUNNER_TEMP/assets" \
+                 --deployed-url "https://menta-linux.github.io/apt/generation.json")
+          echo "$out"
+          echo "$out" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read().splitlines()[-1]); print("published=" + str(d["published"]).lower()); print("site=" + d.get("site", ""))' >> "$GITHUB_OUTPUT"
+      - if: steps.render.outputs.published == 'true'
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b
+        with:
+          path: ${{ steps.render.outputs.site }}
+      - if: steps.render.outputs.published == 'true'
+        id: deploy
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e
+      - name: Post-deployment check (signed metadata served and verifiable with the published key)
+        if: steps.render.outputs.published == 'true'
+        run: |
+          set -e
+          base=https://menta-linux.github.io/apt
+          curl -fsSL -o "$RUNNER_TEMP/menta.gpg" "$base/menta.gpg"
+          for s in stable staging unstable; do
+            curl -fsSL -o "$RUNNER_TEMP/InRelease" "$base/dists/$s/InRelease"
+            gpgv --keyring "$RUNNER_TEMP/menta.gpg" "$RUNNER_TEMP/InRelease"
+          done
+          curl -fsSL "$base/generation.json"
